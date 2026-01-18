@@ -1,179 +1,135 @@
 #!/usr/bin/env python3
-
 import requests
 import time
 import os
 import sys
+import math
+from collections import deque
 
-# --- LED Matrix Setup ---
-# This block will only run on a Raspberry Pi with the rpi-rgb-led-matrix library installed.
+# --- 1. CONFIGURATION ---
+MATRIX_ROWS = 64
+MATRIX_COLS = 64
+FONT_PATH = "fonts/4x6.bdf" 
+STATIC_DISPLAY_TIME = 15 
+FETCH_INTERVAL = 60
+OPENSKY_URL = "https://opensky-network.org/api/states/all?lamin=51.28&lomin=-0.51&lamax=51.69&lomax=0.33"
+
+# Update these to your actual location for accurate distance!
+HOME_LAT = 51.5074 
+HOME_LON = -0.1278
+
+AIRLINE_MAP = {
+    "BAW": "BRITISH AIR", "EZY": "EASYJET", "RYR": "RYANAIR",
+    "AFR": "AIR FRANCE", "DLH": "LUFTHANSA", "UAE": "EMIRATES",
+    "VIR": "VIRGIN ATL", "KLM": "KLM ROYAL", "VLG": "VUELING"
+}
+
+# --- 2. SETUP ---
 try:
     from rgbmatrix import RGBMatrix, RGBMatrixOptions, graphics
     is_pi = True
 except ImportError:
+    from RGBMatrixEmulator import RGBMatrix, RGBMatrixOptions, graphics
     is_pi = False
-    # Mock classes for local development
-    class MockRGBMatrix:
-        def Clear(self):
-            print("--- Mock Matrix Cleared ---")
 
-    class MockRGBMatrixOptions: pass
-    
-    class MockFont:
-        def LoadFont(self, path):
-            print(f"--- Mock Font Loaded: {path} ---")
-
-    class MockGraphics:
-        def __init__(self):
-            self.font = MockFont()
-
-        def Font(self):
-            return self.font
-
-        def Color(self, r, g, b):
-            return (r, g, b)
-
-        def DrawText(self, matrix, font, x, y, color, text):
-            print(f"--- Drawing on Mock Matrix ---\n{text}\n--------------------------")
-
-    RGBMatrix = MockRGBMatrix
-    RGBMatrixOptions = MockRGBMatrixOptions
-    graphics = MockGraphics()
-
-
-# --- Matrix Configuration ---
-MATRIX_ROWS = 64
-MATRIX_COLS = 64
-FONT_PATH = "fonts/4x6.bdf" # Path relative to the script
-TEXT_COLOR = (255, 255, 255) # White
-
-# Global matrix and font objects
 matrix = None
 font = None
 
 def setup_matrix():
-    """Initializes the LED matrix if running on a Pi."""
     global matrix, font
-    if not is_pi:
-        print("Not a Raspberry Pi. Using console output for display.")
-        # In non-Pi environment, graphics.Font() returns a mock object
-        font = graphics.Font()
-        font.LoadFont(FONT_PATH) # Simulate loading font
-        matrix = RGBMatrix() # This will be our mock matrix
-        return
-
-    print("Setting up LED matrix on Raspberry Pi...")
     options = RGBMatrixOptions()
     options.rows = MATRIX_ROWS
     options.cols = MATRIX_COLS
-    options.chain_length = 1
-    options.parallel = 1
-    options.hardware_mapping = 'adafruit-hat-pwm'  # Use 'adafruit-hat' for original HAT
-    
-    # These settings can be fine-tuned for your specific 64x64 panel
-    # options.pwm_bits = 11
-    # options.pwm_lsb_nanoseconds = 130
-    # options.brightness = 100
-    # options.gpio_slowdown = 4
-
+    if is_pi:
+        options.hardware_mapping = 'adafruit-hat-pwm'
+        options.gpio_slowdown = 2
     matrix = RGBMatrix(options=options)
-    
     font = graphics.Font()
-    # The font path must be absolute for the C++ library
-    font_abs_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), FONT_PATH)
-    font.LoadFont(font_abs_path)
+    font_path = os.path.join(os.path.dirname(__file__), FONT_PATH)
+    if os.path.exists(font_path):
+        font.LoadFont(font_path)
+
+def calculate_distance(p_lat, p_lon):
+    """Haversine formula to calculate distance in km."""
+    if not p_lat or not p_lon: return 0
+    R = 6371 
+    dlat = math.radians(p_lat - HOME_LAT)
+    dlon = math.radians(p_lon - HOME_LON)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(HOME_LAT)) * math.cos(math.radians(p_lat)) * math.sin(dlon/2)**2
+    return R * (2 * math.atan2(math.sqrt(a), math.sqrt(1-a)))
+
+def draw_static_frame(plane):
+    # Data Mapping
+    callsign = (plane[1] or "N/A").strip()
+    icao24 = plane[0].upper()
+    squawk = plane[14] or "----"
     
-    print("Matrix setup complete.")
+    # Identify Airline
+    prefix = callsign[:3]
+    airline = AIRLINE_MAP.get(prefix, "PRIVATE/OTHER")
+    
+    alt_ft = int((plane[7] or 0) * 3.28084)
+    speed_kt = int((plane[9] or 0) * 1.94384)
+    v_rate = int((plane[11] or 0) * 196.85)
+    
+    # Distance
+    dist_km = calculate_distance(plane[6], plane[5])
 
-
-def draw_text_on_matrix(text):
-    """
-    Draws the given text on the LED matrix.
-    If not on a Pi, it prints the text to the console via the mock objects.
-    """
-    if matrix is None or font is None:
-        print("Matrix not initialized.")
-        return
-
-    if not is_pi:
-        # Our mock DrawText will handle the console output
-        graphics.DrawText(matrix, font, 0, 0, TEXT_COLOR, text)
-        return
-
-    # When on the Pi, use the real matrix object
     matrix.Clear()
-    lines = text.split('\n')
-    y_pos = 6  # Start y-position for the first line (font height is 6)
-    white_color = graphics.Color(*TEXT_COLOR)
+    c_cyan = graphics.Color(0, 255, 255)
+    c_white = graphics.Color(255, 255, 255)
+    c_green = graphics.Color(0, 255, 0)
+    c_red = graphics.Color(255, 50, 50)
+    c_gold = graphics.Color(255, 215, 0)
 
-    for line in lines:
-        graphics.DrawText(matrix, font, 1, y_pos, white_color, line)
-        y_pos += 7 # Move to the next line (6px font height + 1px spacing)
+    if font:
+        # Layout: 7 lines of data, perfectly spaced
+        graphics.DrawText(matrix, font, 2, 7, c_cyan, f"CALL: {callsign}")
+        graphics.DrawText(matrix, font, 2, 15, c_green, f"AIRL: {airline}")
+        graphics.DrawText(matrix, font, 2, 23, c_white, f"ALT : {alt_ft} FT")
+        graphics.DrawText(matrix, font, 2, 31, c_white, f"SPD : {speed_kt} KT")
+        
+        # Vertical Rate with custom color
+        v_color = c_red if v_rate < -500 else c_cyan if v_rate > 500 else c_white
+        graphics.DrawText(matrix, font, 2, 39, v_color, f"VRT : {v_rate} FPM")
+        
+        graphics.DrawText(matrix, font, 2, 47, c_gold, f"DIST: {dist_km:.1f} KM")
+        graphics.DrawText(matrix, font, 2, 55, c_white, f"SQWK: {squawk}")
+        
+        # Small Bottom Label
+        graphics.DrawText(matrix, font, 2, 63, c_white, f"ICAO: {icao24}")
 
-# --- Configuration for OpenSky --
-# The values below are for a box around London, UK.
-LAT_MIN = 51.2868
-LAT_MAX = 51.6918
-LON_MIN = -0.5103
-LON_MAX = 0.3340
+    # 30-second wait
+    start_time = time.time()
+    while time.time() - start_time < STATIC_DISPLAY_TIME:
+        time.sleep(0.1)
 
-OPENSKY_API_URL = f"https://opensky-network.org/api/states/all?lamin={LAT_MIN}&lomin={LON_MIN}&lamax={LAT_MAX}&lomax={LON_MAX}"
-
-
-# --- Data Fetching ---
-def get_flight_data(api_url):
-    """Fetches flight data from the OpenSky Network API."""
+def fetch_data():
     try:
-        response = requests.get(api_url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        return data.get('states', [])
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching data: {e}")
-        return None
+        r = requests.get(OPENSKY_URL, timeout=10)
+        return r.json().get('states', []) or []
+    except:
+        return []
 
-# --- Main Logic ---
 def main():
-    """Main loop to fetch data and display it."""
     setup_matrix()
-    print("Airplane display script started.")
+    flight_queue = deque(fetch_data())
+    last_fetch = time.time()
 
-    try:
-        while True:
-            print("Fetching flight data...")
-            flight_states = get_flight_data(OPENSKY_API_URL)
+    while True:
+        if not flight_queue:
+            flight_queue.extend(fetch_data())
+            if not flight_queue:
+                time.sleep(10)
+                continue
 
-            display_text = ""
-            if flight_states:
-                # Filter flights and get the top ones (up to 9 for a 64x64 display with 4x6 font)
-                top_flights = sorted(
-                    [s for s in flight_states if s[1] and s[7]],
-                    key=lambda x: x[7],
-                    reverse=True
-                )[:9]
+        draw_static_frame(flight_queue.popleft())
+        
+        if time.time() - last_fetch > FETCH_INTERVAL:
+            new_data = fetch_data()
+            if new_data:
+                flight_queue = deque(new_data)
+                last_fetch = time.time()
 
-                if top_flights:
-                    for state in top_flights:
-                        callsign = state[1].strip()[:7]  # Limit callsign length
-                        altitude_m = state[7]
-                        altitude_ft = int(altitude_m * 3.28084)
-                        # Format to align text neatly on the display
-                        display_text += f"{callsign:<7} {altitude_ft:>5}ft\n"
-                else:
-                    display_text = "\n\n  No flights in area"
-            else:
-                display_text = "\n\n      API Error"
-
-            draw_text_on_matrix(display_text.strip())
-
-            print("Waiting 60 seconds for next update...")
-            time.sleep(60)
-
-    except KeyboardInterrupt:
-        print("\nExiting...")
-        if is_pi and matrix:
-            matrix.Clear() # Clear the matrix on exit
-        sys.exit(0)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
